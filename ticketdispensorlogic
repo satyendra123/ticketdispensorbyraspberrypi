@@ -2,3 +2,135 @@
   and suppose some users have the monthly pass so in that case we provide him by a rfid card and he recharge the rfid on monthly basis. so when user tap the rfid on the ticket dispensor then the controller send the http request to the server with that rfid and fetch the information that how many days or balance left in his car and the barrier will open.
 and in the exit side when the user will go by his qr code then in the system we have the barcode scanner and the printer. when the client will scan his qr code so based on the entry time and exit time his money will be calculated 
 and stored in the database. and after payin the bill when user clicks on the print button printer prints the data and user will get this. as soon as the printer prints the barrier will open
+
+python
+Copy code
+from machine import Pin, UART, I2C, SPI
+import time
+from time import sleep, ticks_ms, localtime, strftime
+from uQR import QRCode
+from i2c_lcd import I2cLcd
+from mfrc522 import MFRC522
+import urequests as requests
+
+# Setup UART for printer
+uart_printer = UART(1, baudrate=9600, tx=17, rx=16)
+
+# Setup Button
+button = Pin(4, Pin.IN, Pin.PULL_UP)
+
+# Setup Loop Sensor
+entryLoopPin = 5
+entryLoop = Pin(entryLoopPin, Pin.IN, Pin.PULL_UP)
+debounceDelay = 50  # Debounce delay in milliseconds
+lastEntryTime = 0
+
+# Setup I2C for LCD
+i2c = I2C(0, scl=Pin(22), sda=Pin(21), freq=400000)
+I2C_ADDR = 0x27  # Change if your LCD uses a different address
+lcd = I2cLcd(i2c, I2C_ADDR, 2, 16)  # Adjust if your LCD size is different
+
+# Setup SPI for RFID
+spi = SPI(1, baudrate=1000000, polarity=0, phase=0, sck=Pin(18), mosi=Pin(23), miso=Pin(19))
+rfid_reader = MFRC522(spi, Pin(5), Pin(4))
+
+SERVER_URL = 'http://your_server_url_here'
+
+# Read RFID tag and get data from server
+def read_rfid():
+    (stat, tag_type) = rfid_reader.request(rfid_reader.REQIDL)
+    if stat == rfid_reader.OK:
+        (stat, uid) = rfid_reader.anticoll()
+        if stat == rfid_reader.OK:
+            rfid_tag = ''.join(['%02X' % x for x in uid])
+            response = requests.get(SERVER_URL + '/get_data', params={'rfid_tag': rfid_tag})
+            if response.status_code == 200:
+                data = response.json()  # Assuming server responds with JSON data
+                return rfid_tag, data
+    return None, None
+
+# Print QR code (this depends on your printer model)
+def print_qr_code(qr):
+    uart_printer.write(qr)
+
+# Deduct parking fee from balance
+def deduct_parking_fee(balance, parking_fee):
+    if balance is None:
+        return None
+    new_balance = balance - parking_fee
+    if new_balance < 0:
+        return None  # Insufficient balance
+    return new_balance
+
+# Main loop
+def main():
+    global lastEntryTime
+    lcd.clear()
+    lcd.putstr("Waiting for car")
+
+    while True:
+        currentTime = ticks_ms()
+        
+        # Handle entry detection with debounce
+        entryReading = entryLoop.value()
+        if entryReading == 0 and (currentTime - lastEntryTime >= debounceDelay):
+            sleep(0.05)
+            if entryLoop.value() == 0:
+                lastEntryTime = currentTime
+                
+                # Check for button press
+                if not button.value():
+                    current_time = time.time()
+                    rfid_tag, data = read_rfid()
+                    if rfid_tag and data is not None:
+                        # Get parking fee and balance from data
+                        parking_fee = data.get('parking_fee', 0)
+                        balance = data.get('balance', 0)
+                        
+                        # Deduct parking fee from balance
+                        new_balance = deduct_parking_fee(balance, parking_fee)
+                        if new_balance is None:
+                            lcd.clear()
+                            lcd.putstr("Insufficient Balance")
+                            continue
+
+                        # Update the balance on the server
+                        response = requests.post(SERVER_URL + '/update_balance', json={'rfid_tag': rfid_tag, 'new_balance': new_balance})
+                        if response.status_code != 200:
+                            lcd.clear()
+                            lcd.putstr("Error updating balance")
+                            continue
+
+                        # Generate QR code
+                        qr_data = "RFID Tag: " + rfid_tag + " | Balance: " + str(new_balance)
+                        qr = QRCode()
+                        qr.add_data(qr_data)
+                        qr.make()
+                        
+                        # Print QR code
+                        print_qr_code(qr)
+                        print('Printed QR code with RFID tag and data')
+                        
+                        # Display on LCD
+                        lcd.clear()
+                        lcd.putstr("QR Code Printed")
+                        lcd.move_to(0, 1)
+                        lcd.putstr(strftime('%Y-%m-%d %H:%M:%S', localtime(current_time)))
+
+                        # Wait for button release
+                        while not button.value():
+                            time.sleep(0.1)
+                    else:
+                        lcd.clear()
+                        lcd.putstr("RFID read failed")
+
+                else:
+                    lcd.clear()
+                    lcd.putstr("Car Detected")
+                    lcd.move_to(0, 1)
+                    lcd.putstr("Press Button")
+
+        time.sleep(0.1)
+
+if __name__ == '__main__':
+    main()
